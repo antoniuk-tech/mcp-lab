@@ -1,0 +1,193 @@
+# Kyiv School Readiness Agent
+
+An agent that decides which Kyiv schools should switch to distance learning
+during winter weather, and where a limited number of backup generators should
+be sent, minimising the number of primary-school pupils (grades 1-4) forced
+online.
+
+The decision chain is: weather forecast -> severity class -> per-school
+readiness -> learning-mode plan. Each step consumes the output of the previous
+one, so a different forecast produces a different plan over the same registry.
+
+## Architecture
+
+Three separate processes:
+
+| Process | Role |
+|---|---|
+| `agent.py` | Agent and MCP client. Runs the LLM loop, owns both connections. |
+| `server.py` | Custom MCP server `kyiv-school-readiness`. Three tools over a local dataset. |
+| `mcp-weather` | Approved external MCP server (OpenWeather), compiled from Go. |
+
+Both servers communicate over stdio: the agent starts each one as a child
+process and exchanges JSON-RPC messages through its standard input/output.
+No network ports, no state shared between runs.
+
+The custom server never calls the network. It reads `data/schools.csv` and
+`config/thresholds.json` only. The external server is the only component that
+reaches the internet.
+
+## Tools
+
+Custom server (`kyiv-school-readiness`):
+
+| Tool | Responsibility |
+|---|---|
+| `edu_classify_weather_severity` | Turns daily forecast figures into a severity class (normal / elevated / severe / critical) using configurable thresholds. |
+| `edu_assess_school_readiness` | Evaluates every school against the severity class: power level, heating capability, hot water, resulting status, gaps, and whether a generator would change the outcome. |
+| `edu_plan_learning_mode` | Produces the learning-mode plan and allocates a limited number of generators by explicit ranking rules. |
+
+External server: `weather` (city, units, lang) returns current conditions plus
+a five-day forecast in three-hour slots as plain text.
+
+Full contracts with schemas, error codes and examples: `docs/tool_contracts.md`.
+
+## Prerequisites
+
+- macOS or Linux
+- Python 3.13 (the project pins `mcp` below version 2.0, see Limitations)
+- Go 1.20+ (only to build the external weather server)
+- Node.js 18+ (only for MCP Inspector, optional)
+- An OpenWeatherMap API key (free tier is sufficient)
+- An OpenRouter API key (the agent uses `openai/gpt-4o` through OpenRouter)
+
+## Installation
+
+    git clone <repository-url> mcp-lab
+    cd mcp-lab
+    python3.13 -m venv .venv
+    source .venv/bin/activate
+    pip install -r requirements.txt
+
+Build the external weather server outside this repository:
+
+    mkdir -p ~/dev/external && cd ~/dev/external
+    git clone https://github.com/mschneider82/mcp-openweather.git
+    cd mcp-openweather && go build -o mcp-weather
+
+The agent expects the binary at `~/dev/external/mcp-openweather/mcp-weather`.
+Change `WEATHER_SERVER` in `agent.py` if you place it elsewhere.
+
+## Configuration
+
+Copy `.env.example` to `.env` and fill in both keys:
+
+    cp .env.example .env
+
+`.env` is listed in `.gitignore` and is never committed. The agent loads it
+with `python-dotenv` and passes `OWM_API_KEY` to the weather server through
+the child process environment, so the key never appears on a command line or
+in shell history.
+
+## Running the custom server independently
+
+The custom server starts on its own, without the agent:
+
+    npx @modelcontextprotocol/inspector .venv/bin/python server.py
+
+Then: toggle to Connected -> Tools -> List Tools. All three tools appear with
+their schemas and annotations.
+
+Note: MCP Inspector does not forward environment variables from the shell to
+the child process. This does not affect the custom server, which needs none,
+but the external weather server returns empty values when started this way.
+Use the direct call below to test that one instead.
+
+## Running the external server independently
+
+    cd ~/dev/external/mcp-openweather
+    echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weather","arguments":{"city":"Kyiv"}}}' | OWM_API_KEY=$(grep OWM_API_KEY ~/dev/mcp-lab/.env | cut -d= -f2 | tr -d '\r\n') ./mcp-weather
+
+## Running the agent
+
+    python agent.py --generators 3
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--city` | `Kyiv` | City for the forecast. English names only, as the external tool requires. |
+| `--generators` | `2` | Generators available for allocation (0-100). |
+| `--assume-severity` | none | Skip the forecast and use the given severity class. The answer is explicitly marked as based on an assumption. |
+
+Examples:
+
+    python agent.py --generators 3
+    python agent.py --generators 3 --assume-severity critical
+    python agent.py --city Qxzvbn --generators 3
+
+The first is a live forecast, the second a winter scenario, the third the
+failure scenario for an unresolvable city.
+
+## Data
+
+`data/schools.csv` contains 41 synthetic records for 10 Kyiv districts,
+generated by `scripts/generate_dataset.py` with a fixed seed (42), so the
+dataset is reproducible.
+
+The data is synthetic on purpose. Publishing real infrastructure vulnerability
+data for schools in a city under regular shelling would be irresponsible, and
+the assignment is about tool design rather than the accuracy of a register.
+District names are real, but no real district is labelled as vulnerable: the
+mapping between districts and infrastructure states carries no factual claim.
+
+`insulation_status` represents the result of a building thermal survey carried
+out before the heating season, in three grades (poor / ok / good). All schools
+are assumed to have been surveyed, which makes them comparable.
+
+`SCH-041` is intentionally defective: `students_primary` (1300) exceeds
+`students_total` (1120). It demonstrates validation. It is excluded from
+results and reported in `invalid_records` with a reason, never silently
+dropped.
+
+Because the custom server uses a local dataset and performs no network calls
+at runtime, the prepared dataset is the deterministic demo input and recorded
+API fixtures are not required for it.
+
+## Design decisions
+
+Full rationale: `docs/design_rationale.md`. In short:
+
+- Three tools rather than one with a mode flag: different responsibilities,
+  and the model must be able to pick one without reading documentation.
+- Heat and electricity are separate channels because they fail for different
+  reasons: a boiler house with its own generator keeps a school warm through
+  a blackout.
+- Thresholds live in `config/thresholds.json`, not in code. No regulation
+  defines an outdoor temperature that mandates distance learning; that
+  decision belongs to the school's founding authority, so the numbers must be
+  visible and changeable.
+- Deterministic scoring: every rule is plain Python. The model chooses which
+  tools to call and writes the summary; all numbers come from tools.
+
+## Known limitations
+
+- Wind and snowfall are absent from the forecast. The external server returns
+  wind speed only for current conditions and no precipitation amounts at all.
+  The agent uses current wind as an approximation for all days and sets
+  snowfall to zero, and states this in every answer.
+- `inspection_overdue` depends on the current date, so this one gap flag is
+  not reproducible across years. Statuses are unaffected. Passing an
+  evaluation date as a parameter would fix it.
+- Threshold boundaries belong to the milder class. A minimum of exactly -12 C
+  is `elevated`, not `severe`, because thresholds are named `*_below` and
+  compared strictly.
+- `in_person_with_generator` is counted as in-person in the summary, which has
+  two counters for three modes.
+- `invalid_records` is not filtered by district. A defect is a fact about the
+  file, not about the query, so it stays visible under any filter.
+- `mcp` is pinned below 2.0. In `mcp` 2.0.0 the `mcp.server.fastmcp` module
+  was removed and the class renamed to `MCPServer` in `mcp.server.mcpserver`.
+  Note that `mcp-types` in `requirements.txt` is a different package with its
+  own version numbering.
+
+## Repository layout
+
+    agent.py                     agent and MCP client
+    server.py                    custom MCP server (three tools)
+    config/thresholds.json       severity thresholds, versioned
+    data/schools.csv             synthetic school registry (41 rows)
+    scripts/generate_dataset.py  dataset generator, seed 42
+    docs/tool_contracts.md       full tool contracts
+    docs/design_rationale.md     design decisions and trade-offs
+    docs/defence_checklist.md    demonstration script
+    requirements.txt             pinned dependencies
+    .env.example                 configuration template
