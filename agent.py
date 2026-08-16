@@ -169,6 +169,14 @@ async def run(city: str, generators: int, assumed: str | None):
                 async with ClientSession(w_r, w_w) as weather:
                     await weather.initialize()
 
+                    weather_tools = (await weather.list_tools()).tools
+                    print(f"MCP-підключення 1 — kyiv-school-readiness "
+                          f"(інструментів: {len(own_tools)}): "
+                          f"{', '.join(t.name for t in own_tools)}")
+                    print(f"MCP-підключення 2 — mcp-openweather "
+                          f"(інструментів: {len(weather_tools)}): "
+                          f"{', '.join(t.name for t in weather_tools)}")
+
                     tools = mcp_tools_to_openai(own_tools) + [FORECAST_TOOL]
 
                     task = (
