@@ -275,6 +275,122 @@ def load_schools() -> tuple[list[dict], list[dict]]:
     return valid, invalid
 
 
+
+# --- Логіка оцінювання ----------------------------------------------------
+
+# Порядок важливий, як і в LEVELS: індекс = ступінь погіршення.
+STATUS_ORDER = ["ok", "at_risk", "fail"]
+
+# Таблиця кроку 4. Ключ — (теплова спроможність, група ізоляції),
+# значення — статус для кожного класу суворості в порядку LEVELS.
+# Ізоляція групується: good і ok поводяться однаково, окремо стоїть лише poor.
+HEAT_STATUS_TABLE = {
+    ("full", "good"):    ["ok", "ok",      "ok",      "ok"],
+    ("full", "poor"):    ["ok", "ok",      "ok",      "at_risk"],
+    ("partial", "good"): ["ok", "ok",      "at_risk", "fail"],
+    ("partial", "poor"): ["ok", "at_risk", "fail",    "fail"],
+    ("none", "good"):    ["ok", "fail",    "fail",    "fail"],
+    ("none", "poor"):    ["ok", "fail",    "fail",    "fail"],
+}
+
+
+def worsen(status: str) -> str:
+    """Погіршує статус на один щабель, не нижче fail."""
+    return STATUS_ORDER[min(STATUS_ORDER.index(status) + 1, len(STATUS_ORDER) - 1)]
+
+
+def assess_one(row: dict, severity: str, force_generator: bool = False) -> dict:
+    """Оцінює один заклад за кроками 1-5 розділу 6.
+
+    force_generator=True означає «а якби генератор був» — саме цим
+    викликом рахується generator_would_help. Логіка написана один раз
+    і викликається двічі; дублювати її не можна, інакше гіпотетичний
+    розрахунок з часом розійдеться з фактичним."""
+
+    has_generator = row["has_generator"] or force_generator
+    parts = []
+
+    # Крок 1. Рівень живлення.
+    if row["central_power_status"] == "stable" or has_generator:
+        power_level = "full"
+    elif row["central_power_status"] == "limited":
+        power_level = "partial"
+    else:
+        power_level = "none"
+
+    # Крок 2. Теплова спроможність.
+    # Обігрівачі дають partial і лише за повного живлення — без електрики
+    # вони не гріють нічого.
+    if row["central_heat_status"] == "available" or row["has_autonomous_boiler"]:
+        heat_capability = "full"
+    elif row["has_electric_heaters"] and power_level == "full":
+        heat_capability = "partial"
+    else:
+        heat_capability = "none"
+
+    # Крок 3. Гаряча вода.
+    water_ok = (
+        row["central_heat_status"] == "available"
+        or (row["has_water_heating"] and power_level != "none")
+    )
+
+    # Крок 4. Статус за теплом.
+    insulation_group = "poor" if row["insulation_status"] == "poor" else "good"
+    status = HEAT_STATUS_TABLE[(heat_capability, insulation_group)][LEVELS.index(severity)]
+    limiting_factor = "heat" if status != "ok" else "none"
+    parts.append(
+        f"тепло {heat_capability}, ізоляція {row['insulation_status']}, "
+        f"severity {severity} дає {status}"
+    )
+
+    # Крок 5. Обмежувачі поза теплом. Три різні за силою:
+    # none — вирок, partial — щабель погіршення, вода — стеля.
+    if power_level == "none":
+        status = "fail"
+        limiting_factor = "power"
+        parts.append("power_level=none дає fail незалежно від решти")
+    elif power_level == "partial":
+        worsened = worsen(status)
+        if worsened != status:
+            status = worsened
+            limiting_factor = "power"
+            parts.append(f"power_level=partial погіршив на щабель до {status}")
+
+    if not water_ok and status == "ok":
+        status = "at_risk"
+        limiting_factor = "water"
+        parts.append("гарячої води немає, тому не краще за at_risk")
+
+    if status == "ok":
+        limiting_factor = "none"
+
+    return {
+        "power_level": power_level,
+        "heat_capability": heat_capability,
+        "water_ok": water_ok,
+        "status": status,
+        "limiting_factor": limiting_factor,
+        "rationale": "; ".join(parts),
+    }
+
+
+def collect_gaps(row: dict) -> list[str]:
+    """Крок 7. Прогалини не впливають на статус, але фіксуються:
+    заклад може виконувати норматив сьогодні й лишатися без резерву."""
+    gaps = []
+    if (date.today() - row["last_inspection_date"]).days > 365:
+        gaps.append("inspection_overdue")
+    if not row["has_generator"]:
+        gaps.append("no_backup_power")
+    if not row["has_autonomous_boiler"]:
+        gaps.append("no_backup_heat")
+    if not row["has_water_heating"]:
+        gaps.append("no_water_heating")
+    if row["insulation_status"] == "poor":
+        gaps.append("poor_insulation")
+    return gaps
+
+
 class InvalidRecord(BaseModel):
     school_id: str | None
     reason: str
@@ -285,6 +401,14 @@ class AssessedSchool(BaseModel):
     district: str
     students_total: int
     students_primary: int
+    power_level: str
+    heat_capability: str
+    water_ok: bool
+    status: str
+    limiting_factor: str
+    generator_would_help: bool
+    gaps: list[str]
+    rationale: str
 
 
 class ReadinessReport(BaseModel):
@@ -319,8 +443,6 @@ def edu_assess_school_readiness(
 
     valid, invalid = load_schools()
 
-    # Перелік районів будується з даних, а не зі списку в коді:
-    # так підказка в помилці завжди відповідає фактичному вмісту файлу.
     districts = sorted({row["district"] for row in valid})
 
     if district is not None:
@@ -332,15 +454,35 @@ def edu_assess_school_readiness(
     else:
         selected = valid
 
-    assessed = [
-        AssessedSchool(
+    assessed = []
+    for row in selected:
+        result = assess_one(row, severity)
+
+        # Крок 6: той самий заклад, але з генератором. Допоміг, якщо
+        # статус став кращим, тобто його індекс у STATUS_ORDER менший.
+        with_generator = assess_one(row, severity, force_generator=True)
+        generator_would_help = (
+            STATUS_ORDER.index(with_generator["status"])
+            < STATUS_ORDER.index(result["status"])
+        )
+
+        if only_problematic and result["status"] == "ok":
+            continue
+
+        assessed.append(AssessedSchool(
             school_id=row["school_id"],
             district=row["district"],
             students_total=row["students_total"],
             students_primary=row["students_primary"],
-        )
-        for row in selected
-    ]
+            power_level=result["power_level"],
+            heat_capability=result["heat_capability"],
+            water_ok=result["water_ok"],
+            status=result["status"],
+            limiting_factor=result["limiting_factor"],
+            generator_would_help=generator_would_help,
+            gaps=collect_gaps(row),
+            rationale=result["rationale"],
+        ))
 
     return ReadinessReport(
         assessed=assessed,
