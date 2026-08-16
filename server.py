@@ -492,5 +492,175 @@ def edu_assess_school_readiness(
     )
 
 
+
+# --- Планування режиму навчання -------------------------------------------
+
+
+class PlanItem(BaseModel):
+    school_id: str
+    mode: str
+    generator_rank: int | None
+    reason: str
+
+
+class Allocation(BaseModel):
+    assigned: int
+    unused: int
+    unassigned_candidates: int
+
+
+class PlanSummary(BaseModel):
+    schools_in_person: int
+    schools_distance: int
+    students_primary_affected: int
+    students_total_affected: int
+
+
+class LearningModePlan(BaseModel):
+    plan: list[PlanItem]
+    allocation: Allocation
+    summary: PlanSummary
+    excluded_invalid: int
+    thresholds_version: str
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+def edu_plan_learning_mode(
+    severity: str,
+    generators_available: int,
+    district: str | None = None,
+) -> LearningModePlan:
+    """Формує план режиму навчання для закладів освіти за заданих погодних умов
+    і обмеженої кількості резервних генераторів. Повертає режим для кожного
+    закладу, адресний розподіл генераторів з обґрунтуванням і зведені показники.
+    Викликай після класифікації погодних умов."""
+
+    if severity not in LEVELS:
+        fail("INVALID_SEVERITY",
+             f"Значення severity '{severity}' поза переліком.",
+             f"Очікується одне з: {', '.join(LEVELS)}.")
+
+    if generators_available < 0 or generators_available > 100:
+        fail("INVALID_RESOURCE_COUNT",
+             f"generators_available = {generators_available} поза межами.",
+             "Очікується ціле від 0 до 100.")
+
+    valid, invalid = load_schools()
+    districts = sorted({row["district"] for row in valid})
+
+    if district is not None:
+        if district not in districts:
+            fail("UNKNOWN_DISTRICT",
+                 f"Район '{district}' не знайдено.",
+                 f"Доступні: {', '.join(districts)}.")
+        selected = [row for row in valid if row["district"] == district]
+    else:
+        selected = valid
+
+    # Крок 1. Оцінка готовності — та сама логіка, що і в другому інструменті.
+    records = []
+    for row in selected:
+        result = assess_one(row, severity)
+        with_generator = assess_one(row, severity, force_generator=True)
+        records.append({
+            "school_id": row["school_id"],
+            "students_total": row["students_total"],
+            "students_primary": row["students_primary"],
+            "status": result["status"],
+            "status_with_generator": with_generator["status"],
+            "generator_would_help": (
+                STATUS_ORDER.index(with_generator["status"])
+                < STATUS_ORDER.index(result["status"])
+            ),
+            "rationale": result["rationale"],
+        })
+
+    # Крок 2. Фільтр кандидатів: лише ті, кому генератор змінить статус.
+    # Заклад зі статусом ok сюди не потрапляє за визначенням — покращувати
+    # нічого, тож generator_would_help у нього завжди false.
+    candidates = [r for r in records if r["generator_would_help"]]
+
+    # Крок 3. Ранжування. Три критерії поспіль; мінус перед числом означає
+    # спадання, school_id сортується за зростанням і робить порядок
+    # відтворюваним навіть за повного збігу двох попередніх критеріїв.
+    candidates.sort(
+        key=lambda r: (-r["students_primary"], -r["students_total"], r["school_id"])
+    )
+
+    ranks = {r["school_id"]: position + 1 for position, r in enumerate(candidates)}
+
+    # Крок 4. Видача за рангом, доки ресурс не вичерпано.
+    receivers = {r["school_id"] for r in candidates[:generators_available]}
+
+    # Крок 5. Режим для кожного закладу.
+    plan = []
+    for record in records:
+        school_id = record["school_id"]
+        rank = ranks.get(school_id)
+
+        if record["status"] == "ok":
+            mode = "in_person"
+            reason = f"статус ok, генератор не потрібен; {record['rationale']}"
+        elif school_id in receivers:
+            mode = "in_person_with_generator"
+            reason = (
+                f"статус {record['status']}; генератор змінює на "
+                f"{record['status_with_generator']}; "
+                f"{record['students_primary']} учнів 1-4 класів, ранг {rank}"
+            )
+        elif rank is not None:
+            mode = "distance"
+            reason = (
+                f"статус {record['status']}; генератор допоміг би, "
+                f"але ранг {rank} при {generators_available} доступних"
+            )
+        else:
+            mode = "distance"
+            reason = (
+                f"статус {record['status']}; генератор не змінює статусу; "
+                f"{record['rationale']}"
+            )
+
+        plan.append(PlanItem(
+            school_id=school_id,
+            mode=mode,
+            generator_rank=rank,
+            reason=reason,
+        ))
+
+    # Порядок видачі — за school_id: план читає людина, і стабільний
+    # порядок дає змогу порівнювати два запуски рядок у рядок.
+    plan.sort(key=lambda item: item.school_id)
+
+    distance_ids = {item.school_id for item in plan if item.mode == "distance"}
+    distance_records = [r for r in records if r["school_id"] in distance_ids]
+
+    return LearningModePlan(
+        plan=plan,
+        allocation=Allocation(
+            assigned=len(receivers),
+            unused=generators_available - len(receivers),
+            unassigned_candidates=len(candidates) - len(receivers),
+        ),
+        summary=PlanSummary(
+            # Очно = і без генератора, і з генератором: обидва режими
+            # означають, що діти йдуть до школи.
+            schools_in_person=len(plan) - len(distance_ids),
+            schools_distance=len(distance_ids),
+            students_primary_affected=sum(r["students_primary"] for r in distance_records),
+            students_total_affected=sum(r["students_total"] for r in distance_records),
+        ),
+        excluded_invalid=len(invalid),
+        thresholds_version=THRESHOLDS["version"],
+    )
+
+
 if __name__ == "__main__":
     mcp.run()
