@@ -1,0 +1,12 @@
+{
+  "version": "2026.11",
+  "temperature_c": {
+    "elevated_below": -5,
+    "severe_below": -12,
+    "critical_below": -20
+  },
+  "flags": {
+    "storm_wind_ms": 15,
+    "heavy_snowfall_mm": 20
+  }
+}
