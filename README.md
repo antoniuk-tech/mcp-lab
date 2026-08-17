@@ -53,7 +53,7 @@ Full contracts with schemas, error codes and examples: `docs/tool_contracts.md`.
 
 ## Installation
 
-    git clone <repository-url> mcp-lab
+    git clone https://github.com/antoniuk-tech/mcp-lab.git
     cd mcp-lab
     python3.13 -m venv .venv
     source .venv/bin/activate
